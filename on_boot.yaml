@@ -6,25 +6,30 @@ esphome:
     - constants.h
 
   on_boot:
-    priority: 800
+    priority: -100
     then:
-      - logger.log: "Boot Device"    
       - lambda: |-
-          id(flow_rate) = 0;
-          id(flow_volume) = 0;
-          id(boot_time_ms) = millis();          
-          ESP_LOGI("Boot", "Waiting to connect...");
 
-          id(flow_rate_sensor_ui).publish_state(0.0);
-          id(flow_volume_sensor_ui).publish_state(0.0); 
+          ESP_LOGI("BOOT", "Restoring RTC state");
 
+          id(machine_state) = (machine_state_t)id(rtc_machine_state);
+          id(vanne_active) = id(rtc_vanne_active);
+          id(next_event_index) = id(rtc_next_event_index);
+          id(next_irrigation_epoch) = id(rtc_next_irrigation_epoch);
+          id(mode_init) = id(rtc_mode_init);
 
+          ESP_LOGI("BOOT", "state=%d vanne=%d event=%d",
+                   id(machine_state),
+                   id(vanne_active),
+                   id(next_event_index));
+          id(machine_state) = ST_NEXT_EVENT;
+ #     - script.execute: compute_next_event
 
 esp32:
   board: esp32dev
   framework:
     type: esp-idf
-#   type: arduino
+#    type: arduino
   
 logger:
 # level: INFO
@@ -32,3 +37,12 @@ logger:
   logs:
     wifi: WARN
     api: WARN
+    mqtt: WARN
+    ota: WARN
+    sensor: WARN
+    pulse_counter: WARN
+    text_sensor: WARN
+    number: WARN
+    select: WARN
+    scheduler: INFO    
+#    switch: WARN

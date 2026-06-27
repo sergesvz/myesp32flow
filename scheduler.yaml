@@ -1,80 +1,359 @@
-interval:
+script:
 
-  - interval: 2s
+  # -------------------------
+  # COMPUTE NEXT EVENT
+  # -------------------------
+
+  - id: compute_next_event
+    mode: restart
+    then:
+    - logger.log: "Compute Next Event"
+    - lambda: |-
+        auto now = id(ntp_time).now();
+        if (!now.is_valid()) return;
+
+        int current = now.hour * 60 + now.minute;
+        int day = now.day_of_week - 1;
+        if (day < 0 || day > 6) return;
+
+        // STATE INIT
+        int best_index = -1;
+        int best_delta = 7 * 24 * 60; // MUSt BE 7 jours  en min 
+
+        // PLC LOOP
+        for (int i = 0; i < 4; i++)
+        {
+          uint8_t mask = id(vanne_day)[i];
+          if (mask == 0) continue;
+          int t = (id(vanne_hour)[i]) * 60 + id(vanne_minute)[i];
+          if (id(vanne_duration)[i] <= 0) continue;
+          for (int offset = 0; offset < 7; offset++)
+          {
+            int test_day = (day + offset) % 7;
+            if (!(mask & (1 << test_day))) continue;
+
+            //delta = temps (min) restant jusqu'au prochain événement 
+            int delta = offset * 1440 + t - current;
+            if (delta < 0) delta += 10080;
+
+            if (delta < best_delta)
+            {
+              best_delta = delta;
+              best_index = i;
+            }
+          }
+        }
+
+        // -------------------------
+        // sécurité minimale
+        // -------------------------
+        if (best_index >= 0 && best_delta < 1)
+          best_delta = 1;
+
+        id(next_event_index) = best_index;
+
+        if (best_index < 0)
+        {
+            id(next_irrigation_epoch)=0;
+            ESP_LOGW("scheduler","No valid event");
+            return;
+        }
+        else
+        {
+          id(next_irrigation_epoch) = now.timestamp + (best_delta * 60);
+        }
+ 
+        ESP_LOGI("sched", "Next event idx=%d delta=%d", best_index, best_delta);
+
+# -------------------------
+  # Start SCHEDULER ?
+  # -------------------------
+
+  - id: scheduler_check
+    mode: single
+    then:
+
+      - lambda: |-
+
+          //check good Event
+          //---------------
+          if (id(fsm_lock))
+          {
+            ESP_LOGW("scheduler", "FSM already running");
+            return;
+          }
+
+          if (id(driver_busy))
+          {
+              ESP_LOGD("scheduler", "Driver busy");
+              return;
+          }
+
+          //check good time
+          //---------------
+          auto now = id(ntp_time).now();
+          if (!now.is_valid())
+          {
+            ESP_LOGW("scheduler", "Time not valid -> skip");
+            id(system_ready) = false;
+            return;
+          }
+          uint32_t now_epoch = now.timestamp;
+          ESP_LOGI("scheduler", "now=%u next=%u",  now_epoch, id(next_irrigation_epoch));
+
+          // CHECK DUE
+          // -------------------------
+          if (id(next_irrigation_epoch) == 0)
+          {
+            ESP_LOGW("scheduler", "No schedule defined");
+            return;
+          }
+          else
+          {
+            id(system_ready) = true;
+          }
+
+          if (now_epoch >= id(next_irrigation_epoch))
+          {
+            ESP_LOGI("scheduler", "IRRIGATION DUE");
+            // START  FSM
+            // ?? id(machine_state) = ST_SELECT_VANNE;
+            id(fsm_lock) = true;
+            id(vanne_active) = -1;    
+          }
+  
+
+  # -------------------------
+  # SCHEDULER FSM
+  # -------------------------
+  - id: fsm_tick
+    mode: restart
     then:
       - lambda: |-
 
-          uint32_t now = millis();
-          switch (id(machine_state)) 
+          // FSM mode Auto en cours
+          if (id(fsm_tick_lock)) return;
+
+          // Mode manuel via UI/driver
+          if (id(driver_busy)) return;
+
+          id(fsm_tick_lock) = true;      
+          switch (id(machine_state))
           {
 
-            // -------------------------
-            case STATE_BOOT:
+            case ST_SELECT_VANNE:
+            {
+                id(vanne_active)=id(next_event_index);
 
-              // attendre 30 s
-              if (now - id(boot_time_ms) >= 30000)
+                if ((id(vanne_active)<0) || (id(vanne_active)>=4))
+                {
+                    id(machine_state)=ST_ERROR;
+                    break;
+                }
+                // armement du timer; sinon risque d'ouverture prématurée sur OPEN_VANNE
+                id(state_timer)=millis();
+                id(machine_state)=ST_OPEN_VANNE;
+                break;
+            }
+            // -------------------------
+            case ST_OPEN_VANNE:
+            {
+              if (millis() - id(state_timer) < 500)  break;
+              ESP_LOGI("FSM", "OPEN VANNE %d", id(vanne_active));
+
+              id(open_vanne).execute(id(vanne_active));
+              id(state_timer) = millis();
+              id(machine_state) = ST_WATERING;
+
+              break;
+            }
+
+            // -------------------------
+            case ST_WATERING:
+            {
+              uint32_t duration =  id(vanne_duration)[id(vanne_active)] * 60000UL;
+
+              if (millis() - id(state_timer) >= duration)
               {
-                id(machine_state) = STATE_WAITING;
-                ESP_LOGI( "SCH", "Boot delay finished => STATE_WAITING");
+                id(machine_state) = ST_CLOSE_VANNE;
+              }
+
+              break;
+            }
+
+            // -------------------------
+            case ST_CLOSE_VANNE:
+            {
+              ESP_LOGI("FSM", "CLOSE VANNE %d", id(vanne_active));
+              id(close_vanne).execute(id(vanne_active));
+              id(machine_state) = ST_NEXT_EVENT;
+
+              break;
+            }
+            // -------------------------
+            case ST_NEXT_EVENT:
+
+              id(compute_next_event).execute(); 
+              id(machine_state) = ST_IDLE;
+              break;
+            // -------------------------
+
+            // -------------------------
+            case ST_IDLE:
+
+            // Start to WAit 10min sans Deep Sleep
+              id(state_timer) = millis();
+
+              // Run calcul event
+              id(scheduler_check).execute();
+
+              id(machine_state) = ST_SELECT_VANNE;;
+              
+              // No deep Sleep
+              id(mode_init) = true;              
+              break;
+            // -------------------------
+
+
+            case ST_TIMEOUT:
+            {
+              uint32_t duration_manual_idle =  600000;
+
+              if (millis() - id(state_timer) >= duration_manual_idle)
+              {
+
+                    if (id(vanne_active) >= 0 && id(vanne_active) < 4)
+                    {
+                      // forcer la fermeture de toutes les vannes apres un delai de 10min                    
+                      // pas que de la derniere vanne_active =>  TODO
+                      id(machine_state) = ST_MANUAL_CLOSE;
+                    }
+                    else
+                    {
+                      id(machine_state) = ST_SLEEP;
+                    }
+                    id(mode_init) = false;  // fin des 10 min d'accès manuelle config sans boot
               }
               break;
-
-
+            }
             // -------------------------
-            // En attente Flow
-            //-------------------------
-            case STATE_WAITING:
-
-              if (id(id(flow_pulses)) > 0) 
-              {
-                ESP_LOGI( "SCH", "Flow detected:%d", id(flow_pulses));
-                id(machine_state) = STATE_RUNNING;
-              } 
+            case ST_MANUAL_OPEN:
+            {
+              ESP_LOGI("FSM", "MANUAL OPEN %d", id(vanne_active));
+              if (id(vanne_active) >= 0 && id(vanne_active) < 4)
+              { 
+                id(open_vanne).execute(id(vanne_active));
+                id(machine_state) = ST_IDLE;
+              }
               break;
+            }
+            // -------------------------
+            case ST_MANUAL_CLOSE:
+            {
+              ESP_LOGI("FSM", "MANUAL CLOSE vanne%d", id(vanne_active));
+              id(close_vanne).execute(id(vanne_active));
+              id(machine_state) = ST_SLEEP;
+
+              break;
+            }
 
             // -------------------------
-            case STATE_RUNNING:
+            case ST_ERROR:
+            {
+              ESP_LOGE("FSM", "ERROR STATE");
+              id(fsm_lock) = false;   // IMPORTANT
+              id(machine_state) = ST_SLEEP;
 
-              if (id(flow_no_pulse_seconds) > 20) 
+              break;
+            }
+
+            // -------------------------
+            case ST_SLEEP:
+            {
+              if (!id(system_ready))
               {
-                ESP_LOGI( "SCH", "no more Flow, pulses:%d", id(flow_pulses));              
-                id(machine_state) = STATE_SLEEP;
+                // check NTP ready
+                ESP_LOGW("FSM", "Sleep blocked (system not ready)");
+                break;
               }
 
-              id(flow_compute).execute();
-              id(flow_update_ui).execute();
-
-              if (now - id(mqtt_last_publish_ms) > 2000)
+              if (!id(mode_init))
               {
-                id(flow_mqtt_publish).execute();
-                id(mqtt_last_publish_ms) = now;
-              }               
-
+                ESP_LOGI("FSM", "END -> SLEEP");
+                id(vanne_active)=-1;
+                id(close_vanne_all).execute();
+                id(sleep_requested) = true;
+                id(fsm_lock)=false;
+                id(go_sleep).execute();
+              }
               break;
-
-            // -------------------------
-            case STATE_SLEEP:
-              ESP_LOGI( "SCH", "Go to sleep");
-              id(go_sleep).execute();
-              break;
-          
-            // -------------------------
-            case STATE_ERROR:
-
-              id(machine_state) = STATE_SLEEP;
-              ESP_LOGI( "SCH", "ERROR !!");
-              break;
+            }
           }
+          id(fsm_tick_lock) = false;
+        
 
-
-script:
-
-  - id: go_sleep
+  - id: save_state
     mode: single
     then:
       - lambda: |-
-          id(mqtt_publish_go_sleep).execute();
-          ESP_LOGI("SCH", "Go DeepSleep");
-      - delay: 300ms
+          id(rtc_machine_state) = id(machine_state);
+          id(rtc_vanne_active) = id(vanne_active);
+          id(rtc_next_event_index) = id(next_event_index);
+          id(rtc_next_irrigation_epoch) = id(next_irrigation_epoch);
+          id(rtc_mode_init) = id(mode_init);
 
-      - deep_sleep.enter:
+          ESP_LOGI("RTC", "State saved");
+          
+ 
+  - id: go_sleep
+    mode: single
+    then:
+
+      - lambda: |-
+
+          constexpr uint32_t PRE_WAKE_SEC = 30;
+
+          auto now = id(ntp_time).now();
+
+          if (!now.is_valid()) {
+            ESP_LOGW("sleep", "NTP invalid -> 60s fallback");
+            esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+            esp_deep_sleep_start();
+          }
+
+          int32_t delta_sec =
+              (int32_t)(id(next_irrigation_epoch) - now.timestamp);
+
+          if (id(next_event_index) < 0) {
+            ESP_LOGW("sleep", "No event -> 5min sleep");
+            esp_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
+            esp_deep_sleep_start();
+          }
+
+          int32_t sleep_sec = delta_sec - PRE_WAKE_SEC;
+
+          if (sleep_sec < 10) sleep_sec = 10;
+
+          ESP_LOGI("sleep",
+                   "delta=%d sleep=%d prewake=%d",
+                   delta_sec, sleep_sec, PRE_WAKE_SEC);
+
+          // SAVE RTC STATE BEFORE SLEEP
+          id(save_state).execute();
+
+          esp_sleep_enable_timer_wakeup(
+              (uint64_t)sleep_sec * 1000000ULL);
+
+          esp_deep_sleep_start();
+
+  # -------------------------
+  # WATTERING ACTION Auto / Manual
+  # -------------------------
+interval:
+  - interval: 1s
+    then:
+      - script.execute: fsm_tick   
+
+#  - interval: 30s
+#    then:
+#      - script.execute: scheduler_check
