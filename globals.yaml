@@ -1,0 +1,55 @@
+globals:
+
+  - id: machine_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: water_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pulse_count
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: last_pulse_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+   
+#usefull ?
+  - id: state_timer
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: sleep_requested
+    type: bool
+    initial_value: 'false'
+
+  - id: boot_time_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+#timer de syncho MQTT publish
+  - id: mqtt_last_publish_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+
+  - id: mqtt_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'    
+
+
+  - id: wifi_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'

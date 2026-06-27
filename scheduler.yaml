@@ -1,0 +1,80 @@
+interval:
+
+  - interval: 2s
+    then:
+      - lambda: |-
+
+          uint32_t now = millis();
+          switch (id(machine_state)) 
+          {
+
+            // -------------------------
+            case STATE_BOOT:
+
+              // attendre 30 s
+              if (now - id(boot_time_ms) >= 30000)
+              {
+                id(machine_state) = STATE_WAITING;
+                ESP_LOGI( "SCH", "Boot delay finished => STATE_WAITING");
+              }
+              break;
+
+
+            // -------------------------
+            // En attente Flow
+            //-------------------------
+            case STATE_WAITING:
+
+              if (id(id(flow_pulses)) > 0) 
+              {
+                ESP_LOGI( "SCH", "Flow detected:%d", id(flow_pulses));
+                id(machine_state) = STATE_RUNNING;
+              } 
+              break;
+
+            // -------------------------
+            case STATE_RUNNING:
+
+              if (id(flow_no_pulse_seconds) > 20) 
+              {
+                ESP_LOGI( "SCH", "no more Flow, pulses:%d", id(flow_pulses));              
+                id(machine_state) = STATE_SLEEP;
+              }
+
+              id(flow_compute).execute();
+              id(flow_update_ui).execute();
+
+              if (now - id(mqtt_last_publish_ms) > 2000)
+              {
+                id(flow_mqtt_publish).execute();
+                id(mqtt_last_publish_ms) = now;
+              }               
+
+              break;
+
+            // -------------------------
+            case STATE_SLEEP:
+              ESP_LOGI( "SCH", "Go to sleep");
+              id(go_sleep).execute();
+              break;
+          
+            // -------------------------
+            case STATE_ERROR:
+
+              id(machine_state) = STATE_SLEEP;
+              ESP_LOGI( "SCH", "ERROR !!");
+              break;
+          }
+
+
+script:
+
+  - id: go_sleep
+    mode: single
+    then:
+      - lambda: |-
+          id(mqtt_publish_go_sleep).execute();
+          ESP_LOGI("SCH", "Go DeepSleep");
+      - delay: 300ms
+
+      - deep_sleep.enter:

@@ -1,0 +1,142 @@
+globals:
+
+  # Nombre total d'impulsions Hall
+  - id: flow_pulses
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Nombre d'impulsions à la dernière mesure
+  - id: flow_pulses_last
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Nombre de secondes sans impulsion
+  - id: flow_no_pulse_seconds
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Volume total (L)
+  - id: flow_volume
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  # Débit instantané (L/min)
+  - id: flow_rate
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+
+binary_sensor:
+
+  - platform: gpio
+    id: flow_binary_sensor_id
+    name: "${flow_sensor_name} pulses"
+
+    pin:
+      number: ${flow_pin}
+      mode:
+        input: true
+        pullup: true
+
+    internal: true
+
+    on_press:
+      then:
+        - lambda: |-
+            id(flow_pulses)++;
+
+
+
+####################
+##  UI / Dashboard
+####################
+sensor:
+
+  - platform: template
+    id: flow_rate_sensor_ui 
+    name: ${flow_sensor_name} Débit
+    unit_of_measurement: "L/min"
+    accuracy_decimals: 2
+    update_interval: never
+    lambda: |-
+      if (isnan(id(flow_rate)) || id(flow_rate) < 0) {
+        return 0.0f;
+      }
+      return id(flow_rate);
+
+  - platform: template
+    id: flow_volume_sensor_ui
+    name: ${flow_sensor_name} Volume
+    unit_of_measurement: "L"
+    accuracy_decimals: 3
+    update_interval: never
+    lambda: |-
+      if (isnan(id(flow_volume)) || id(flow_volume) < 0) {
+        return 0.0f;
+      }
+      return id(flow_volume);
+
+script:
+
+  - id: flow_compute
+    mode: restart
+    then:
+    - logger.log: "Compute Flow"
+    - lambda: |-
+
+        // delta: impulsions reçues pendant la dernière seconde
+        int32_t delta = (int32_t)(id(flow_pulses) - id(flow_pulses_last));
+        if (delta < 0) delta = 0;
+        id(flow_pulses_last) =  id(flow_pulses);
+
+        // YF-B : débit(L/min) = Hz / 7.5
+        static uint32_t last_ms = millis();
+        uint32_t now_ms = millis();
+        float dt = (now_ms - last_ms) / 1000.0f;
+        last_ms = now_ms;
+        id(flow_rate) = ((float)delta / 7.5f) / dt;
+
+        // Volume :  // 450 impulsions = 1 litre
+        id(flow_volume) =  ((float)id(flow_pulses)) / ${flow_pulse_factor};
+
+        // Détection absence de débit
+        if (delta == 0)
+        {
+          id(flow_rate) = 0.0f;
+          id(flow_no_pulse_seconds)++;
+        }
+        else
+          id(flow_no_pulse_seconds) = 0;
+
+        
+  - id: flow_update_ui
+    then:
+      - component.update: flow_rate_sensor_ui
+      - component.update: flow_volume_sensor_ui 
+
+
+###################
+## MQTT
+###################
+
+  - id: flow_mqtt_publish
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(mqtt_ready);
+          then:
+            - lambda: |-
+                ESP_LOGI("Flow", "flow_mqtt_publish: flow_l_min=%.2f, volume_l=%.3f", id(flow_rate), id(flow_volume));          
+            - mqtt.publish_json:
+                topic: ${topic}/${device_name}/data
+                payload: |-
+                  root["flow_l_min"] = id(flow_rate);
+                  root["volume_l"] = id(flow_volume);
+         

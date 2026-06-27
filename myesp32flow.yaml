@@ -1,0 +1,38 @@
+substitutions:
+  device_name: "myesp32flow"
+  topic: "irrigation"
+#  api_key: !secret api_385e88_key 
+
+packages:
+
+  boot:    !include packages/on_boot.yaml
+  globals: !include packages/globals.yaml
+  api_key: !include packages/secrets/esp_adbb88.yaml
+
+  network: 
+    !include  
+    file: packages/network.yaml
+    vars:
+      network_ip: "192.168.1.45"
+
+  deep_sleep:
+    !include  
+    file: packages/deep_sleep.yaml
+    vars:
+# //sec  => polling    
+      deep_sleep_timer: "60s"   
+      deep_sleep_status_pin: GPIO3    
+
+# ui:    !include packages/irrigation_ui.yaml
+ 
+  debimetre1:
+    !include
+    file: "packages/sensors/debimetre_yfb.yaml"
+    vars:
+      flow_pin: GPIO33
+      flow_sensor_name: "Débitmètre1"
+      flow_pulse_factor: "450.0"
+      flow_pulse_update: "5s"
+
+# scripts: !include packages/script.yaml
+  scheduler: !include packages/scheduler.yaml
